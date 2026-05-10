@@ -398,6 +398,54 @@ pub async fn proxy_fetch_uncached_with_link(
         .map_err(|e| map_proxy_error(repo_key, path, e))
 }
 
+/// Fetch an artifact with change detection.
+///
+/// Like [`proxy_fetch`] but additionally returns a `bool` indicating
+/// whether the upstream content changed compared to the previously cached
+/// version. This is used by the Debian handler to detect when
+/// Release/InRelease changes so that related Packages caches can be
+/// invalidated to maintain APT hash consistency.
+///
+/// Returns `(content, content_type, content_changed)`.
+pub async fn proxy_fetch_detecting_change(
+    proxy_service: &ProxyService,
+    repo_id: Uuid,
+    repo_key: &str,
+    upstream_url: &str,
+    path: &str,
+) -> Result<(Bytes, Option<String>, bool), Response> {
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+
+    proxy_service
+        .fetch_artifact_detecting_change(&repo, path)
+        .await
+        .map_err(|e| map_proxy_error(repo_key, path, e))
+}
+
+/// Invalidate all Packages index caches for a Debian distribution.
+///
+/// Called when InRelease/Release content changes to ensure Packages files
+/// are re-fetched from upstream to match the new release metadata.
+/// Failures are logged but do not propagate — cache invalidation is
+/// best-effort.
+pub async fn invalidate_dist_packages_cache(
+    proxy_service: &ProxyService,
+    repo_key: &str,
+    distribution: &str,
+) {
+    if let Err(e) = proxy_service
+        .invalidate_dist_packages_cache(repo_key, distribution)
+        .await
+    {
+        tracing::warn!(
+            "Failed to invalidate Packages cache for {}/dists/{}: {}",
+            repo_key,
+            distribution,
+            e
+        );
+    }
+}
+
 /// Strategy for fetching an artifact from a single virtual member.
 ///
 /// Exposed for unit testing the branching logic in

@@ -365,6 +365,160 @@ impl ProxyService {
         Ok(())
     }
 
+    /// Invalidate all cached metadata for a Debian distribution,
+    /// **except** the Release/InRelease/Release.gpg files themselves.
+    ///
+    /// When an APT Release/InRelease file changes upstream, every file
+    /// it references (Packages, Contents, dep11 Components, i18n
+    /// Translations, cnf Commands, etc.) is almost certainly different
+    /// too. This method deletes all of them so the next request
+    /// re-fetches from upstream, guaranteeing hash consistency with the
+    /// freshly-cached Release metadata.
+    ///
+    /// Release, InRelease and Release.gpg caches are intentionally
+    /// **kept** so the caller can cache a new Release in the same
+    /// request without it being immediately deleted.
+    pub async fn invalidate_dist_packages_cache(
+        &self,
+        repo_key: &str,
+        distribution: &str,
+    ) -> Result<()> {
+        let prefix = format!(
+            "proxy-cache/{}/dists/{}/",
+            repo_key,
+            distribution.trim_matches('/'),
+        );
+
+        let keys = self.storage.list(Some(&prefix)).await?;
+        let mut deleted = 0usize;
+        for key in &keys {
+            // Determine the path relative to the distribution root.
+            // Top-level release files must be preserved; everything
+            // else (Packages, Contents, dep11, i18n, cnf, source, etc.)
+            // is invalidated.
+            let relative = key
+                .strip_prefix(&prefix)
+                .unwrap_or(key)
+                .trim_start_matches('/');
+            let is_release_file = matches!(
+                relative,
+                "Release" | "InRelease" | "Release.gpg" | "gpg-key.asc"
+            );
+            if !is_release_file {
+                let _ = self.storage.delete(key).await;
+                deleted += 1;
+            }
+        }
+
+        if deleted > 0 {
+            tracing::info!(
+                "Invalidated {} cached metadata entries for {}/dists/{}",
+                deleted,
+                repo_key,
+                distribution,
+            );
+        }
+        Ok(())
+    }
+
+    /// Fetch an artifact like [`fetch_artifact`] but additionally report
+    /// whether the upstream content **changed** compared to the previously
+    /// cached version.
+    ///
+    /// Returns `(content, content_type, content_changed)`.
+    ///
+    /// * `content_changed = false` — cache hit (content served from cache)
+    ///   **or** cache miss but the upstream content has the same SHA-256 as
+    ///   the previous cache entry (upstream unchanged between TTL windows).
+    /// * `content_changed = true` — cache miss **and** the upstream content
+    ///   differs from the previously cached version (or no prior cache
+    ///   existed).
+    ///
+    /// This is used by the Debian handler to detect when Release/InRelease
+    /// content changes so that related Packages caches can be invalidated.
+    pub async fn fetch_artifact_detecting_change(
+        &self,
+        repo: &Repository,
+        path: &str,
+    ) -> Result<(Bytes, Option<String>, bool)> {
+        if repo.repo_type != RepositoryType::Remote {
+            return Err(AppError::Validation(
+                "Proxy operations only supported for remote repositories".to_string(),
+            ));
+        }
+
+        let upstream_url = repo.upstream_url.as_ref().ok_or_else(|| {
+            AppError::Config("Remote repository missing upstream_url".to_string())
+        })?;
+
+        let cache_key = Self::cache_storage_key(&repo.key, path)?;
+        let metadata_key = Self::cache_metadata_key(&repo.key, path)?;
+
+        // Load old metadata (may exist even if expired) to obtain the
+        // previous checksum for change detection.
+        let old_checksum = self
+            .load_cache_metadata(&metadata_key)
+            .await?
+            .map(|m| m.checksum_sha256);
+
+        // If the cache entry is still valid, serve from cache — no change.
+        if let Some((content, content_type)) =
+            self.get_cached_artifact(&cache_key, &metadata_key).await?
+        {
+            return Ok((content, content_type, false));
+        }
+
+        // Cache miss / expired — fetch from upstream.
+        let full_url = Self::build_upstream_url(upstream_url, path);
+        let upstream_result = self.fetch_from_upstream(&full_url, repo.id).await;
+
+        match upstream_result {
+            Ok(resp) => {
+                let new_checksum = StorageService::calculate_hash(&resp.content);
+
+                // Content changed if we had a previous cache with a
+                // different checksum. First-time fetch (no old cache)
+                // is treated as "not changed" because there is nothing
+                // to invalidate downstream.
+                let changed = old_checksum
+                    .as_ref()
+                    .map(|old| old != &new_checksum)
+                    .unwrap_or(false);
+
+                let cache_ttl = self.get_cache_ttl_for_repo(repo.id).await;
+                self.cache_artifact(
+                    &cache_key,
+                    &metadata_key,
+                    &resp.content,
+                    resp.content_type.clone(),
+                    resp.etag,
+                    cache_ttl,
+                    repo.id,
+                    path,
+                )
+                .await?;
+
+                Ok((resp.content, resp.content_type, changed))
+            }
+            Err(upstream_err) => {
+                // Fall back to stale cache if available.
+                if let Ok(Some((stale_content, stale_content_type))) = self
+                    .get_stale_cached_artifact(&cache_key, &metadata_key)
+                    .await
+                {
+                    tracing::warn!(
+                        "Upstream fetch failed for {}; serving stale cached copy: {}",
+                        full_url,
+                        upstream_err
+                    );
+                    Ok((stale_content, stale_content_type, false))
+                } else {
+                    Err(upstream_err)
+                }
+            }
+        }
+    }
+
     /// Get cache TTL configuration for a repository.
     /// Returns TTL in seconds.
     async fn get_cache_ttl_for_repo(&self, repo_id: Uuid) -> i64 {

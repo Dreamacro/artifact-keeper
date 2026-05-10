@@ -397,26 +397,132 @@ impl<'a> DebianProxy<'a> {
         content_type: &'static str,
         repo: &RepoInfo,
     ) -> Result<(), Response> {
-        if repo.repo_type != RepositoryType::Remote {
-            return Ok(());
-        }
-        let (upstream_url, proxy) = match (&repo.upstream_url, &self.state.proxy_service) {
-            (Some(u), Some(p)) => (u, p),
-            _ => return Ok(()),
-        };
-        let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
-        let (content, upstream_ct) =
-            proxy_helpers::proxy_fetch(proxy, repo.id, self.repo_key, upstream_url, &upstream_path)
-                .await?;
-        Err(Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                CONTENT_TYPE,
-                upstream_ct.unwrap_or_else(|| content_type.to_string()),
+        if repo.repo_type == RepositoryType::Remote {
+            let (upstream_url, proxy) = match (&repo.upstream_url, &self.state.proxy_service) {
+                (Some(u), Some(p)) => (u, p),
+                _ => return Ok(()),
+            };
+            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            let (content, upstream_ct) = proxy_helpers::proxy_fetch(
+                proxy,
+                repo.id,
+                self.repo_key,
+                upstream_url,
+                &upstream_path,
             )
-            .header(CONTENT_LENGTH, content.len().to_string())
-            .body(Body::from(content))
-            .unwrap())
+            .await?;
+            Err(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    upstream_ct.unwrap_or_else(|| content_type.to_string()),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap())
+        } else if repo.repo_type == RepositoryType::Virtual {
+            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            let state = self.state;
+            let (content, upstream_ct) = proxy_helpers::resolve_virtual_download(
+                &state.db,
+                state.proxy_service.as_deref(),
+                repo.id,
+                &upstream_path,
+                |member_id, location| {
+                    let db = state.db.clone();
+                    let state = state.clone();
+                    let path = upstream_path.clone();
+                    async move {
+                        proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &path)
+                            .await
+                    }
+                },
+            )
+            .await?;
+            Err(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    upstream_ct.unwrap_or_else(|| content_type.to_string()),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Like `dists()`, but for Release/InRelease: uses change-detection on
+    /// Remote repos and invalidates Packages caches when content changes.
+    async fn dists_detecting_change(
+        &self,
+        suffix: &str,
+        content_type: &'static str,
+        repo: &RepoInfo,
+    ) -> Result<(), Response> {
+        if repo.repo_type == RepositoryType::Remote {
+            let (upstream_url, proxy) = match (&repo.upstream_url, &self.state.proxy_service) {
+                (Some(u), Some(p)) => (u, p),
+                _ => return Ok(()),
+            };
+            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            let (content, upstream_ct, changed) = proxy_helpers::proxy_fetch_detecting_change(
+                proxy,
+                repo.id,
+                self.repo_key,
+                upstream_url,
+                &upstream_path,
+            )
+            .await?;
+            if changed {
+                proxy_helpers::invalidate_dist_packages_cache(
+                    proxy,
+                    self.repo_key,
+                    self.distribution,
+                )
+                .await;
+            }
+            Err(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    upstream_ct.unwrap_or_else(|| content_type.to_string()),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap())
+        } else if repo.repo_type == RepositoryType::Virtual {
+            let upstream_path = format!("dists/{}/{}", self.distribution, suffix);
+            let state = self.state;
+            let (content, upstream_ct) = proxy_helpers::resolve_virtual_download(
+                &state.db,
+                state.proxy_service.as_deref(),
+                repo.id,
+                &upstream_path,
+                |member_id, location| {
+                    let db = state.db.clone();
+                    let state = state.clone();
+                    let path = upstream_path.clone();
+                    async move {
+                        proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &path)
+                            .await
+                    }
+                },
+            )
+            .await?;
+            Err(Response::builder()
+                .status(StatusCode::OK)
+                .header(
+                    CONTENT_TYPE,
+                    upstream_ct.unwrap_or_else(|| content_type.to_string()),
+                )
+                .header(CONTENT_LENGTH, content.len().to_string())
+                .body(Body::from(content))
+                .unwrap())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -438,7 +544,7 @@ async fn release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     proxy
-        .dists("Release", "text/plain; charset=utf-8", &repo)
+        .dists_detecting_change("Release", "text/plain; charset=utf-8", &repo)
         .await?;
 
     let (release, _) = local_release_content(&state, &repo_key, &distribution).await?;
@@ -460,7 +566,7 @@ async fn in_release_file(
 ) -> Result<Response, Response> {
     let (proxy, repo) = DebianProxy::resolve(&state, &repo_key, &distribution).await?;
     proxy
-        .dists("InRelease", "text/plain; charset=utf-8", &repo)
+        .dists_detecting_change("InRelease", "text/plain; charset=utf-8", &repo)
         .await?;
 
     let (release, repo) = local_release_content(&state, &repo_key, &distribution).await?;
@@ -752,35 +858,64 @@ async fn dists_dispatch(
 /// Debian mirrors serve under `dists/`.
 ///
 /// For remote repositories the file is fetched from upstream and returned
-/// directly. For hosted repositories the handler returns 404 because these
-/// metadata files are generated on-the-fly only through the dedicated routes.
+/// directly. For virtual repositories the file is resolved from members.
+/// For hosted repositories the handler returns 404 because these metadata
+/// files are generated on-the-fly only through the dedicated routes.
 async fn dists_proxy_catchall(
     State(state): State<SharedState>,
     Path((repo_key, distribution, dists_path)): Path<(String, String, String)>,
 ) -> Result<Response, Response> {
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
 
-    if repo.repo_type != RepositoryType::Remote {
-        return Err((StatusCode::NOT_FOUND, "Not found").into_response());
+    if repo.repo_type == RepositoryType::Remote {
+        let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
+            (Some(u), Some(p)) => (u, p),
+            _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
+        };
+
+        let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+        let (content, upstream_ct) =
+            proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path)
+                .await?;
+
+        let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .body(Body::from(content))
+            .unwrap())
+    } else if repo.repo_type == RepositoryType::Virtual {
+        let upstream_path = format!("dists/{}/{}", distribution, dists_path);
+        let (content, upstream_ct) = proxy_helpers::resolve_virtual_download(
+            &state.db,
+            state.proxy_service.as_deref(),
+            repo.id,
+            &upstream_path,
+            |member_id, location| {
+                let db = state.db.clone();
+                let state = state.clone();
+                let path = upstream_path.clone();
+                async move {
+                    proxy_helpers::local_fetch_by_path(&db, &state, member_id, &location, &path)
+                        .await
+                }
+            },
+        )
+        .await?;
+
+        let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
+
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, content_type)
+            .header(CONTENT_LENGTH, content.len().to_string())
+            .body(Body::from(content))
+            .unwrap())
+    } else {
+        Err((StatusCode::NOT_FOUND, "Not found").into_response())
     }
-
-    let (upstream_url, proxy) = match (&repo.upstream_url, &state.proxy_service) {
-        (Some(u), Some(p)) => (u, p),
-        _ => return Err((StatusCode::NOT_FOUND, "Not found").into_response()),
-    };
-
-    let upstream_path = format!("dists/{}/{}", distribution, dists_path);
-    let (content, upstream_ct) =
-        proxy_helpers::proxy_fetch(proxy, repo.id, &repo_key, upstream_url, &upstream_path).await?;
-
-    let content_type = upstream_ct.unwrap_or_else(|| content_type_for_dists_path(&dists_path));
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, content_type)
-        .header(CONTENT_LENGTH, content.len().to_string())
-        .body(Body::from(content))
-        .unwrap())
 }
 
 /// Infer a reasonable content-type from the file extension when the upstream
