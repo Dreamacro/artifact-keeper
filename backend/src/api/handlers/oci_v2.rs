@@ -1392,15 +1392,15 @@ async fn handle_get_blob(
                     )
                 }
             };
-            match storage.get(&b.storage_key).await {
-                Ok(data) => {
+            match storage.get_stream(&b.storage_key).await {
+                Ok(stream) => {
                     tracing::debug!(repo = %repo.key, digest = %digest, storage_key = %b.storage_key, "GET blob: serving from migrated oci_blobs (CAS hit)");
                     return Response::builder()
                         .status(StatusCode::OK)
                         .header("Docker-Content-Digest", digest)
-                        .header(CONTENT_LENGTH, data.len().to_string())
+                        .header(CONTENT_LENGTH, b.size_bytes.to_string())
                         .header(CONTENT_TYPE, "application/octet-stream")
-                        .body(Body::from(data))
+                        .body(Body::from_stream(stream))
                         .unwrap();
                 }
                 Err(e) => {
@@ -1982,14 +1982,13 @@ async fn handle_get_manifest(
         };
         let manifest_key = manifest_storage_key(&manifest_digest);
 
-        if let Ok(data) = storage.get(&manifest_key).await {
+        if let Ok(stream) = storage.get_stream(&manifest_key).await {
             tracing::debug!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, "GET manifest: serving from migrated oci_tags (local hit)");
             return Response::builder()
                 .status(StatusCode::OK)
                 .header("Docker-Content-Digest", &manifest_digest)
-                .header(CONTENT_LENGTH, data.len().to_string())
                 .header(CONTENT_TYPE, &content_type)
-                .body(Body::from(data))
+                .body(Body::from_stream(stream))
                 .unwrap();
         }
         tracing::warn!(repo = %repo.key, image = %repo.image, reference = %reference, digest = %manifest_digest, manifest_key = %manifest_key, "GET manifest: oci_tags row found but storage file missing - will proxy from upstream");

@@ -23,11 +23,12 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::api::handlers::proxy_helpers::{check_quarantine_row, internal_error, LocalArtifactRow};
+use crate::api::handlers::proxy_helpers::{
+    check_quarantine_row, internal_error, LocalArtifactRow, StreamingFetchResult,
+};
 use crate::api::AppState;
 use crate::storage::StorageLocation;
 
@@ -122,7 +123,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     repo_id: Uuid,
     location: &StorageLocation,
     artifact_path: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     // Gate 1: Only known secondary-file extensions are eligible. A
     // primary `.jar`/`.aar`/etc. always has its own row and must travel
     // the SQL path so its quarantine/soft-delete state is honored.
@@ -143,7 +144,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     };
     let sibling_prefix = format!("{}/%", gav_dir);
     let primary = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 \
            AND path LIKE $2 \
@@ -169,7 +170,7 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
     // semantics for legitimate misses.
     let storage = state.storage_for_repo_or_500(location)?;
     let storage_key = format!("maven/{}", artifact_path);
-    let content = storage.get(&storage_key).await.map_err(|e| {
+    let stream = storage.get_stream(&storage_key).await.map_err(|e| {
         // Distinguish missing object from real I/O error. Conservative:
         // every backend's "missing" error has "not found" in its
         // Display impl; anything else is internal.
@@ -180,7 +181,11 @@ pub(crate) async fn maven_local_fetch_storage_fallback(
             internal_error("Storage", e)
         }
     })?;
-    Ok((content, None))
+    Ok(StreamingFetchResult {
+        body: stream,
+        content_type: None,
+        content_length: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +199,7 @@ mod tests {
         insert_artifact, put_artifact_bytes, NewArtifact, RepoInfo,
     };
     use crate::api::handlers::test_db_helpers as db_helpers;
+    use bytes::Bytes;
 
     // ── pure-function gates ─────────────────────────────────────────
 
@@ -320,7 +326,7 @@ mod tests {
         .expect("put");
 
         let location = repo.storage_location();
-        let (content, ct) = maven_local_fetch_storage_fallback(
+        let result = maven_local_fetch_storage_fallback(
             &pool,
             &state,
             repo_id,
@@ -329,8 +335,12 @@ mod tests {
         )
         .await
         .expect("fetch");
+        assert!(
+            result.content_type.is_none(),
+            "helper returns None for content-type"
+        );
+        let content = result.collect().await.unwrap();
         assert_eq!(&content[..], &bytes[..]);
-        assert!(ct.is_none(), "helper returns None for content-type");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }
@@ -370,10 +380,11 @@ mod tests {
             )
             .await
             .expect("put");
-            let (content, _) =
+            let result =
                 maven_local_fetch_storage_fallback(&pool, &state, repo_id, &location, &path)
                     .await
                     .unwrap_or_else(|_| panic!("must serve secondary extension {}", suffix));
+            let content = result.collect().await.unwrap();
             assert_eq!(
                 &content[..],
                 &payload[..],
@@ -586,7 +597,7 @@ mod tests {
         )
         .await
         .expect("put maven");
-        let (got, _) = maven_local_fetch_storage_fallback(
+        let result = maven_local_fetch_storage_fallback(
             &pool,
             &state,
             repo_id,
@@ -595,6 +606,7 @@ mod tests {
         )
         .await
         .expect("positive: maven/<path> with live primary serves");
+        let got = result.collect().await.unwrap();
         assert_eq!(&got[..], b"maven-pom");
 
         // (b)

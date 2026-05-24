@@ -14,6 +14,7 @@ use crate::models::repository::{
     ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
 use crate::services::proxy_service::ProxyService;
+pub use crate::services::proxy_service::StreamingFetchResult;
 use crate::storage::StorageLocation;
 use std::time::Duration;
 
@@ -788,10 +789,10 @@ pub async fn resolve_virtual_download<F, Fut>(
     virtual_repo_id: Uuid,
     path: &str,
     local_fetch: F,
-) -> Result<(Bytes, Option<String>), Response>
+) -> Result<StreamingFetchResult, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
 
@@ -813,9 +814,8 @@ where
                 if let (Some(proxy), Some(upstream_url)) =
                     (proxy_service, member.upstream_url.as_deref())
                 {
-                    if let Ok(result) =
-                        proxy_fetch(proxy, member.id, &member.key, upstream_url, path).await
-                    {
+                    let repo = build_remote_repo(member.id, &member.key, upstream_url);
+                    if let Ok(result) = proxy.fetch_artifact_streaming(&repo, path).await {
                         return Ok(result);
                     }
                 }
@@ -872,7 +872,7 @@ pub async fn resolve_virtual_download_streaming<F, Fut>(
 ) -> Result<Response, Response>
 where
     F: Fn(Uuid, StorageLocation) -> Fut,
-    Fut: std::future::Future<Output = Result<(Bytes, Option<String>), Response>>,
+    Fut: std::future::Future<Output = Result<StreamingFetchResult, Response>>,
 {
     let members = fetch_virtual_members(db, virtual_repo_id).await?;
 
@@ -908,15 +908,15 @@ where
                 }
             }
             VirtualMemberFetchStrategy::Local => {
-                if let Ok((content, content_type)) =
-                    local_fetch(member.id, member.storage_location()).await
-                {
-                    return Ok(build_download_response(
-                        content,
-                        content_type,
+                if let Ok(result) = local_fetch(member.id, member.storage_location()).await {
+                    return build_streaming_response_with_disposition(
+                        result,
                         default_content_type,
                         content_disposition_filename,
-                    ));
+                    )
+                    .map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    });
                 }
             }
             VirtualMemberFetchStrategy::Skip => {}
@@ -1097,6 +1097,7 @@ pub async fn fetch_virtual_members(
 pub(crate) struct LocalArtifactRow {
     pub storage_key: String,
     pub content_type: String,
+    pub size_bytes: i64,
     pub quarantine_status: Option<String>,
     pub quarantine_until: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -1120,9 +1121,9 @@ pub async fn local_fetch_by_path(
     repo_id: Uuid,
     location: &StorageLocation,
     artifact_path: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND path = $2 AND is_deleted = false \
          LIMIT 1",
@@ -1137,12 +1138,16 @@ pub async fn local_fetch_by_path(
     check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
+    let stream = storage
+        .get_stream(&artifact.storage_key)
         .await
         .map_err(|e| internal_error("Storage", e))?;
 
-    Ok((content, Some(artifact.content_type)))
+    Ok(StreamingFetchResult {
+        body: stream,
+        content_type: Some(artifact.content_type),
+        content_length: Some(artifact.size_bytes as u64),
+    })
 }
 
 /// Generic local artifact fetch by name and version.
@@ -1154,9 +1159,9 @@ pub async fn local_fetch_by_name_version(
     location: &StorageLocation,
     name: &str,
     version: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let artifact = sqlx::query_as::<_, LocalArtifactRow>(
-        "SELECT storage_key, content_type, quarantine_status, quarantine_until \
+        "SELECT storage_key, content_type, size_bytes, quarantine_status, quarantine_until \
          FROM artifacts \
          WHERE repository_id = $1 AND name = $2 AND version = $3 AND is_deleted = false \
          LIMIT 1",
@@ -1172,12 +1177,16 @@ pub async fn local_fetch_by_name_version(
     check_quarantine_row(&artifact)?;
 
     let storage = state.storage_for_repo_or_500(location)?;
-    let content = storage
-        .get(&artifact.storage_key)
+    let stream = storage
+        .get_stream(&artifact.storage_key)
         .await
         .map_err(|e| internal_error("Storage", e))?;
 
-    Ok((content, Some(artifact.content_type)))
+    Ok(StreamingFetchResult {
+        body: stream,
+        content_type: Some(artifact.content_type),
+        content_length: Some(artifact.size_bytes as u64),
+    })
 }
 
 /// Generic local artifact fetch by trailing path-suffix (LIKE match).
@@ -1202,7 +1211,7 @@ pub async fn local_fetch_by_path_suffix(
     repo_id: Uuid,
     location: &StorageLocation,
     path_suffix: &str,
-) -> Result<(Bytes, Option<String>), Response> {
+) -> Result<StreamingFetchResult, Response> {
     let reversed_pattern = reverse_suffix_for_like(path_suffix);
     let path: String = sqlx::query_scalar(
         "SELECT path FROM artifacts \
@@ -4180,18 +4189,19 @@ mod tests {
         .expect("insert");
 
         let location = repo.storage_location();
-        let (content, ct) =
-            local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
-                .await
-                .expect("fetch");
+        let result = local_fetch_by_path(&pool, &state, repo_id, &location, "foo/1.0/foo.whl")
+            .await
+            .expect("fetch");
+        let ct = result.content_type.clone();
+        let content = result.collect().await.unwrap();
         assert_eq!(&content[..], b"abc123");
         assert_eq!(ct.as_deref(), Some("application/zip"));
 
         // Also exercise the suffix variant.
-        let (content2, _) =
-            local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
-                .await
-                .expect("fetch suffix");
+        let result2 = local_fetch_by_path_suffix(&pool, &state, repo_id, &location, "foo.whl")
+            .await
+            .expect("fetch suffix");
+        let content2 = result2.collect().await.unwrap();
         assert_eq!(&content2[..], b"abc123");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;

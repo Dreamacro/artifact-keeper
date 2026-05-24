@@ -1,10 +1,10 @@
 //! Repository management handlers.
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{Extension, Multipart, Path, Query, State},
-    http::{header, HeaderMap},
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -2683,7 +2683,7 @@ pub async fn download_artifact(
             // Virtual repo: try each member in priority order
             let db = state.db.clone();
             let path_clone = path.clone();
-            let (content, content_type) = proxy_helpers::resolve_virtual_download(
+            let result = proxy_helpers::resolve_virtual_download(
                 &state.db,
                 state.proxy_service.as_deref(),
                 repo.id,
@@ -2703,25 +2703,26 @@ pub async fn download_artifact(
                 AppError::NotFound("Artifact not found in any member repository".to_string())
             })?;
 
-            let ct = content_type.unwrap_or_else(|| "application/octet-stream".to_string());
+            let ct = result
+                .content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string());
             let filename = path.rsplit('/').next().unwrap_or(&path);
 
-            Ok((
-                [
-                    (header::CONTENT_TYPE, ct),
-                    (
-                        header::CONTENT_DISPOSITION,
-                        format!("attachment; filename=\"{}\"", filename),
-                    ),
-                    (header::CONTENT_LENGTH, content.len().to_string()),
-                    (
-                        header::HeaderName::from_static(X_ARTIFACT_STORAGE),
-                        "virtual".to_string(),
-                    ),
-                ],
-                content,
-            )
-                .into_response())
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, ct)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}\"", filename),
+                )
+                .header(
+                    header::HeaderName::from_static(X_ARTIFACT_STORAGE),
+                    "virtual",
+                );
+            if let Some(size) = result.content_length {
+                builder = builder.header(header::CONTENT_LENGTH, size.to_string());
+            }
+            Ok(builder.body(Body::from_stream(result.body)).unwrap())
         }
         Err(e) => Err(e),
     }

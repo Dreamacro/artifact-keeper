@@ -585,7 +585,7 @@ async fn download_image(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = storage.get(&storage_key).await.map_err(|e| {
+    let stream = storage.get_stream(&storage_key).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Storage error: {}", e),
@@ -604,7 +604,7 @@ async fn download_image(
             format!("attachment; filename=\"{}\"", filename),
         )
         .header("X-Checksum-Sha256", checksum)
-        .body(Body::from(content))
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 

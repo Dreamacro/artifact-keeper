@@ -19,6 +19,8 @@ use axum::routing::{get, post};
 use axum::Extension;
 use axum::Router;
 use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -785,8 +787,19 @@ async fn serve_file(
                     )
                     .await
                     {
-                        Ok((content, _ct)) => {
-                            return Ok(build_file_response(filename, content));
+                        Ok(result) => {
+                            let content_type = pypi_content_type(filename);
+                            let mut builder = Response::builder()
+                                .status(StatusCode::OK)
+                                .header(CONTENT_TYPE, content_type)
+                                .header(
+                                    "Content-Disposition",
+                                    format!("attachment; filename=\"{}\"", filename),
+                                );
+                            if let Some(size) = result.content_length {
+                                builder = builder.header(CONTENT_LENGTH, size.to_string());
+                            }
+                            return Ok(builder.body(Body::from_stream(result.body)).unwrap());
                         }
                         Err(e) => {
                             debug!(
@@ -873,26 +886,41 @@ async fn serve_file(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let content = if repo.repo_type == RepositoryType::Remote {
+    let stream = if repo.repo_type == RepositoryType::Remote {
         if let (Some(ref upstream_url), Some(ref proxy)) =
             (&repo.upstream_url, &state.proxy_service)
         {
-            get_remote_cached_or_refetch(storage.as_ref(), &artifact.storage_key, || async move {
-                fetch_from_pypi_remote(proxy, repo.id, repo_key, upstream_url, project, filename)
+            get_remote_cached_or_refetch_stream(
+                storage.as_ref(),
+                &artifact.storage_key,
+                || async move {
+                    fetch_from_pypi_remote(
+                        proxy,
+                        repo.id,
+                        repo_key,
+                        upstream_url,
+                        project,
+                        filename,
+                    )
                     .await
-            })
+                },
+            )
             .await?
         } else {
             storage
-                .get(&artifact.storage_key)
+                .get_stream(&artifact.storage_key)
                 .await
                 .map_err(map_storage_err)?
+                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+                .boxed()
         }
     } else {
         storage
-            .get(&artifact.storage_key)
+            .get_stream(&artifact.storage_key)
             .await
             .map_err(map_storage_err)?
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .boxed()
     };
 
     // Record download statistics for locally-stored artifacts only.
@@ -912,23 +940,25 @@ async fn serve_file(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .header(CONTENT_LENGTH, content.len().to_string())
+        .header(CONTENT_LENGTH, artifact.size_bytes.to_string())
         .header("X-PyPI-File-SHA256", &artifact.checksum_sha256)
-        .body(Body::from(content))
+        .body(Body::from_stream(stream))
         .unwrap())
 }
 
-async fn get_remote_cached_or_refetch<F, Fut>(
+async fn get_remote_cached_or_refetch_stream<F, Fut>(
     storage: &dyn crate::storage::StorageBackend,
     storage_key: &str,
     refetch: F,
-) -> Result<Bytes, Response>
+) -> Result<BoxStream<'static, Result<Bytes, std::io::Error>>, Response>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<Bytes, Response>>,
 {
-    match storage.get(storage_key).await {
-        Ok(content) => Ok(content),
+    match storage.get_stream(storage_key).await {
+        Ok(stream) => Ok(stream
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())))
+            .boxed()),
         Err(AppError::NotFound(_)) => {
             tracing::warn!(
                 storage_key = %storage_key,
@@ -949,7 +979,7 @@ where
                     "failed to write back refetched PyPI proxy payload; subsequent requests will re-fetch from upstream"
                 );
             }
-            Ok(bytes)
+            Ok(futures::stream::once(async { Ok(bytes) }).boxed())
         }
         Err(e) => Err(map_storage_err(e)),
     }
