@@ -43,10 +43,10 @@ pub const DEFAULT_METADATA_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 /// Larger byte ceiling for formats whose metadata documents are legitimately
 /// large and would be truncated by the 8 MiB default: npm packument/meta,
-/// composer packument, pypi simple-index, maven-metadata, and the protobuf
-/// bundle. Matches the existing npm/goproxy capped reads (npm.rs:308/391,
-/// goproxy.rs:295).
-pub const LARGE_METADATA_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// composer packument, pypi simple-index, maven-metadata, protobuf bundle,
+/// and Debian dists indices (trixie's Packages.xz is 9.6 MB; larger suites
+/// like sid can exceed 20 MB).
+pub const LARGE_METADATA_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 /// HTTP client timeout in seconds
 const HTTP_TIMEOUT_SECS: u64 = 60;
@@ -3128,7 +3128,7 @@ impl ProxyService {
             self.fetch_from_upstream_conditional(&full_url, repo.id, etag)
                 .await
         } else {
-            self.fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+            self.fetch_from_upstream(&full_url, repo.id, LARGE_METADATA_MAX_BYTES)
                 .await
                 .map(Some)
         };
@@ -3170,7 +3170,7 @@ impl ProxyService {
                             cache_key = %cache_key,
                             "cached body missing after 304; refetching unconditionally"
                         );
-                        self.fetch_from_upstream(&full_url, repo.id, DEFAULT_METADATA_MAX_BYTES)
+                        self.fetch_from_upstream(&full_url, repo.id, LARGE_METADATA_MAX_BYTES)
                             .await?
                     }
                     Err(e) => return Err(e),
@@ -11150,7 +11150,7 @@ mod tests {
         };
         let server = MockServer::start().await;
         // 9 MiB: above DEFAULT_METADATA_MAX_BYTES (8 MiB), below
-        // LARGE_METADATA_MAX_BYTES (16 MiB).
+        // LARGE_METADATA_MAX_BYTES (128 MiB).
         let big = vec![0x2eu8; 9 * 1024 * 1024];
         assert!(big.len() > DEFAULT_METADATA_MAX_BYTES && big.len() < LARGE_METADATA_MAX_BYTES);
         Mock::given(method("GET"))
@@ -11171,7 +11171,7 @@ mod tests {
         let outcome = proxy.fetch_upstream_direct(&repo, "simple/foo/").await;
         let _ = std::fs::remove_dir_all(&tmp);
         let (body, _ct, _effective) =
-            outcome.expect("a 9 MiB simple index must succeed under the 16 MiB cap");
+            outcome.expect("a 9 MiB simple index must succeed under the 128 MiB cap");
         assert_eq!(body.len(), big.len());
     }
 
